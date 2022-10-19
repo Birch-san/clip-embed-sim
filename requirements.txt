@@ -1,4 +1,6 @@
 open_clip_torch~=2.0
 clip-anytorch~=2.5.0
-torch==1.12.1
-transformers==4.23.1
+pillow~=9.2.0
+torch~=1.12.1
+torchvision~=0.13.1
+transformers~=4.23.1
