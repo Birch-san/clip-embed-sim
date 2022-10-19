@@ -1,0 +1,19 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: embed-sim",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/embed-sim.py",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTORCH_ENABLE_MPS_FALLBACK": "1"
+      }
+    }
+  ]
+}
