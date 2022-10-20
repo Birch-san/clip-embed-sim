@@ -112,7 +112,7 @@ models: List[WrappedModel] = [
 
 img_to_caption = json.load(open('img_to_caption.json', 'r'))
 
-coarse_classes = ['a painting', 'trending on artstation']
+coarse_classes: List[str] = ['a painting', 'trending on artstation']
 coarse_class_tokens: Tensor = open_clip.tokenize(coarse_classes).to(device) # [2, 77]
 
 subjects: List[TestSubject] = [TestSubject(
