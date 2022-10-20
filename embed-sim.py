@@ -2,101 +2,147 @@ import json
 from glob import iglob
 from os import path
 from pathlib import Path
+from typing import Callable, List, NamedTuple, Union
 
-# import clip
 import open_clip
 import torch
-# from open_clip import CLIP as OpenCLIP
+from open_clip import CLIP as OpenCLIP
 from PIL import Image
 from torch import Tensor, no_grad
 from torch.nn import functional as F
-# from torchvision import transforms
-# from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModel
+from typing_extensions import TypeAlias
 
 device=torch.device('mps')
-jit=False
 
-# oai_clip_ver = 'openai/clip-vit-large-patch14'
-# oai_tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(oai_clip_ver)
-# oai_text: CLIPTextModel = CLIPTextModel.from_pretrained(oai_clip_ver)
-# oai_text.requires_grad_(False)
-# oai_vision: CLIPVisionModel = CLIPVisionModel.from_pretrained(oai_clip_ver)
-# oai_vision.requires_grad_(False)
+ImgPreprocess: TypeAlias = Callable[[Image.Image], Tensor]
+DeviceDescriptor: TypeAlias = Union[str, torch.device]
 
-# oai_clip_model, oai_clip_transform = clip.load(name='ViT-L/14', device=device, jit=jit)
+class Topk(NamedTuple):
+  values: Tensor
+  indices: Tensor
 
-# big:
-# laion_model_name = 'ViT-H-14'
-# laion_model_ver = 'laion2b_s32b_b79k'
+class WrappedModel:
+  model_name: str
+  model_ver: str
+  model: OpenCLIP
+  device: DeviceDescriptor
+  img_preprocess: ImgPreprocess
+  def __init__(
+    self,
+    model_name: str,
+    model_ver: str,
+    device: DeviceDescriptor = 'cpu'
+  ) -> None:
+    self.model_name = model_name
+    self.model_ver = model_ver
+    self.device = device
+    model, _, val_preprocess = open_clip.create_model_and_transforms(model_name, model_ver, device=device)
+    model.requires_grad_(False)
+    self.model = model
+    self.img_preprocess = val_preprocess
 
-# less big:
-laion_model_name = 'ViT-B-32'
-laion_model_ver = 'laion2b_s34b_b79k'
+class TestSubject:
+  wrapped_model: WrappedModel
+  coarse_class_text_features: Tensor
+  def __init__(
+    self,
+    wrapped_model: WrappedModel,
+    coarse_class_tokens: Tensor
+  ) -> None:
+    self.wrapped_model=wrapped_model
+    with no_grad():
+      if self.wrapped_model.device.type == 'mps':
+        # run serially (instead of batching), then concat afterward.
+        # to avoid MPS bug on pytorch 1.12.1 where layernorm breaks if tokens.size(dim=0) > 1
+        self.coarse_class_text_features: Tensor = torch.cat([
+          wrapped_model.model.encode_text(caption_tokens) for caption_tokens in coarse_class_tokens.split(1, dim=0)
+        ])
+      else:
+        self.coarse_class_text_features: Tensor = wrapped_model.model.encode_text(coarse_class_tokens)
+  
+  def get_topk(
+    self,
+    pil_img: Image.Image,
+    caption_tokens: Tensor
+  ) -> Topk:
+    model: OpenCLIP = self.wrapped_model.model
+    device: DeviceDescriptor = self.wrapped_model.device
+    img: Tensor = self.wrapped_model.img_preprocess(pil_img) # [3, 244, 244]
+    img_batch: Tensor = img.to(device).unsqueeze(0) # [1, 3, 244, 244]
 
-# attempt to load OpenAI model using openclip
-# laion_model_name = 'ViT-L-14'
-# laion_model_ver = 'openai'
+    # a shorthand is available, but we avoid due to MPS bug on pytorch 1.12.1 where layernorm breaks if encode_text() called with tokens.size(dim=0) > 1
+    # image_features, text_features, logit_scale_exp = laion_model.forward(laion_img_batch, laion_tokens.to(device)) # ([1, 512], [1, 512], [])
 
-# laion_model: OpenCLIP = open_clip.create_model(laion_model_name, laion_model_ver, device=device)
-laion_model, _, laion_val_preprocess = open_clip.create_model_and_transforms(laion_model_name, laion_model_ver, device=device)
-laion_model.requires_grad_(False)
+    with no_grad():
+      caption_text_features: Tensor = model.encode_text(caption_tokens) # [1, 512]
+      image_features: Tensor = model.encode_image(img_batch).to(device) # [n, 512]
 
-# for OpenAI ViT-L-14:
-# mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device)
-# std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device)
-# for LAION checkpoints:
-# mean = laion_model.visual.image_mean
-# std = laion_model.visual.image_std
-# clip_normalize = transforms.Normalize(mean=mean, std=std)
-# actually nevermind we don't need a normalize function; create_model_and_transforms gives us preprocess
+    text_features = torch.cat([caption_text_features, self.coarse_class_text_features])
+    text_features = F.normalize(text_features, dim=-1)
+    image_features = F.normalize(image_features, dim=-1)
+
+    image_features /= image_features.norm(dim=-1, keepdim=True)
+    text_features /= text_features.norm(dim=-1, keepdim=True)
+    similarity = (model.logit_scale.exp() * image_features @ text_features.T).softmax(dim=-1)
+    values, indices = similarity[0].topk(3)
+    return Topk(values=values, indices=indices)
+
+class SubjectTopk(NamedTuple):
+  subject: TestSubject
+  topk: Topk
+
+models: List[WrappedModel] = [
+  # WrappedModel(
+  #   device=device,
+  #   model_name='ViT-H-14',
+  #   model_ver='laion2b_s32b_b79k'
+  # ), # big
+  WrappedModel(
+    device=device,
+    model_name='ViT-B-32',
+    model_ver='laion2b_s34b_b79k'
+  ),
+  WrappedModel(
+    device=device,
+    model_name='ViT-L-14',
+    model_ver='openai'
+  ),
+]
 
 img_to_caption = json.load(open('img_to_caption.json', 'r'))
 
 coarse_classes = ['a painting', 'trending on artstation']
-laion_coarse_class_tokens: Tensor = open_clip.tokenize(coarse_classes).to(device) # [2, 77]
-with no_grad():
-  if device.type == 'mps':
-    # run serially (instead of batching), then concat afterward.
-    # to avoid MPS bug on pytorch 1.12.1 where layernorm breaks if tokens.size(dim=0) > 1
-    laion_coarse_class_text_features: Tensor = torch.cat([laion_model.encode_text(caption_tokens) for caption_tokens in laion_coarse_class_tokens.split(1, dim=0)])
-  else:
-    laion_coarse_class_text_features: Tensor = laion_model.encode_text(laion_coarse_class_tokens)
-logit_scale_exp = laion_model.logit_scale.exp()
+coarse_class_tokens: Tensor = open_clip.tokenize(coarse_classes).to(device) # [2, 77]
+
+subjects: List[TestSubject] = [TestSubject(
+  wrapped_model=wrapped_model,
+  coarse_class_tokens=coarse_class_tokens,
+) for wrapped_model in models]
 
 for filename in iglob('square/*.jpg'):
   assert path.isfile(filename)
   pil_img: Image.Image = Image.open(filename)
-
-  laion_img: Tensor = laion_val_preprocess(pil_img) # [3, 244, 244]
-  laion_img_batch: Tensor = laion_img.to(device).unsqueeze(0) # [1, 3, 244, 244]
-  
   leafname: str = Path(filename).name
   assert leafname in img_to_caption
   caption: str = img_to_caption[leafname]
-  laion_caption_tokens: Tensor = open_clip.tokenize(caption).to(device) # [1, 77]
-  with no_grad():
-    laion_caption_text_features: Tensor = laion_model.encode_text(laion_caption_tokens) # [1, 512]
-    image_features: Tensor = laion_model.encode_image(laion_img_batch).to(device) # [n, 512]
+  classes: List[str] = [caption, *coarse_classes]
+  caption_tokens: Tensor = open_clip.tokenize(caption).to(device) # [1, 77]
 
-  text_features = torch.cat([laion_caption_text_features, laion_coarse_class_text_features])
-  text_features = F.normalize(text_features, dim=-1)
-  image_features = F.normalize(image_features, dim=-1)
+  print(f"Assessing CLIP image-text similarity for image captioned '{caption}'...")
+  subject_topks: List[SubjectTopk] = [
+    SubjectTopk(
+      subject=subject,
+      topk=subject.get_topk(
+        pil_img=pil_img,
+        caption_tokens=caption_tokens
+      )
+    ) for subject in subjects
+  ]
 
-  # image_features, text_features, logit_scale_exp = laion_model.forward(laion_img_batch, laion_tokens.to(device)) # ([1, 512], [1, 512], [])
-
-  image_features /= image_features.norm(dim=-1, keepdim=True)
-  text_features /= text_features.norm(dim=-1, keepdim=True)
-  similarity = (logit_scale_exp * image_features @ text_features.T).softmax(dim=-1)
-  values, indices = similarity[0].topk(3)
-
-  # Print the result
-  print("\nTop predictions:\n")
-  classes = [caption, *coarse_classes]
-  for value, index in zip(values, indices):
-    print(f"{classes[index]:>16s}: {100 * value.item():.2f}%")
+  for subject, topk in subject_topks:
+    print(f"Top predictions for {subject.wrapped_model.model_name} {subject.wrapped_model.model_ver}:")
+    values, indices = topk
+    for value, index in zip(values, indices):
+      print(f"{classes[index]:>16s}: {100 * value.item():.2f}%")
+  
   print("Done")
-
-
-  # laion_target_embed: Tensor = F.normalize(laion_encoded)
-
-# model, preprocess = clip.load("ViT-B/32", device=device, jit=jit)
