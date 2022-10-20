@@ -3,25 +3,25 @@ from glob import iglob
 from os import path
 from pathlib import Path
 
-import clip
+# import clip
 import open_clip
 import torch
-from open_clip import CLIP as OpenCLIP
+# from open_clip import CLIP as OpenCLIP
 from PIL import Image
 from torch import Tensor, no_grad
 from torch.nn import functional as F
-from torchvision import transforms
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModel
+# from torchvision import transforms
+# from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModel
 
 device=torch.device('mps')
 jit=False
 
-oai_clip_ver = 'openai/clip-vit-large-patch14'
-oai_tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(oai_clip_ver)
-oai_text: CLIPTextModel = CLIPTextModel.from_pretrained(oai_clip_ver)
-oai_text.requires_grad_(False)
-oai_vision: CLIPVisionModel = CLIPVisionModel.from_pretrained(oai_clip_ver)
-oai_vision.requires_grad_(False)
+# oai_clip_ver = 'openai/clip-vit-large-patch14'
+# oai_tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(oai_clip_ver)
+# oai_text: CLIPTextModel = CLIPTextModel.from_pretrained(oai_clip_ver)
+# oai_text.requires_grad_(False)
+# oai_vision: CLIPVisionModel = CLIPVisionModel.from_pretrained(oai_clip_ver)
+# oai_vision.requires_grad_(False)
 
 # oai_clip_model, oai_clip_transform = clip.load(name='ViT-L/14', device=device, jit=jit)
 
@@ -53,9 +53,14 @@ laion_model.requires_grad_(False)
 img_to_caption = json.load(open('img_to_caption.json', 'r'))
 
 coarse_classes = ['a painting', 'trending on artstation']
-laion_coarse_class_tokens: Tensor = open_clip.tokenize(coarse_classes) # [2, 77]
-laion_coarse_class_text_features = laion_model.cpu().encode_text(laion_coarse_class_tokens).to(device) # move model to CPU to avoid MPS bug where layernorm breaks if tokens.size(dim=0) > 1
-laion_model.to(device)
+laion_coarse_class_tokens: Tensor = open_clip.tokenize(coarse_classes).to(device) # [2, 77]
+with no_grad():
+  if device.type == 'mps':
+    # run serially (instead of batching), then concat afterward.
+    # to avoid MPS bug on pytorch 1.12.1 where layernorm breaks if tokens.size(dim=0) > 1
+    laion_coarse_class_text_features: Tensor = torch.cat([laion_model.encode_text(caption_tokens) for caption_tokens in laion_coarse_class_tokens.split(1, dim=0)])
+  else:
+    laion_coarse_class_text_features: Tensor = laion_model.encode_text(laion_coarse_class_tokens)
 logit_scale_exp = laion_model.logit_scale.exp()
 
 for filename in iglob('square/*.jpg'):
@@ -69,12 +74,12 @@ for filename in iglob('square/*.jpg'):
   assert leafname in img_to_caption
   caption: str = img_to_caption[leafname]
   laion_caption_tokens: Tensor = open_clip.tokenize(caption).to(device) # [1, 77]
-  laion_caption_text_features: Tensor = laion_model.encode_text(laion_caption_tokens) # [1, 512]
-  # laion_tokens: Tensor = torch.cat([laion_caption_tokens, laion_coarse_class_tokens])
-  # laion_coarse_class_text_features
+  with no_grad():
+    laion_caption_text_features: Tensor = laion_model.encode_text(laion_caption_tokens) # [1, 512]
+    image_features: Tensor = laion_model.encode_image(laion_img_batch).to(device) # [n, 512]
+
   text_features = torch.cat([laion_caption_text_features, laion_coarse_class_text_features])
   text_features = F.normalize(text_features, dim=-1)
-  image_features: Tensor = laion_model.encode_image(laion_img_batch).to(device) # [n, 512]
   image_features = F.normalize(image_features, dim=-1)
 
   # image_features, text_features, logit_scale_exp = laion_model.forward(laion_img_batch, laion_tokens.to(device)) # ([1, 512], [1, 512], [])
