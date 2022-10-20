@@ -63,7 +63,8 @@ class TestSubject:
   def get_topk(
     self,
     pil_img: Image.Image,
-    caption_tokens: Tensor
+    caption_tokens: Tensor,
+    k = 5
   ) -> Topk:
     model: OpenCLIP = self.wrapped_model.model
     device: DeviceDescriptor = self.wrapped_model.device
@@ -84,7 +85,7 @@ class TestSubject:
     image_features /= image_features.norm(dim=-1, keepdim=True)
     text_features /= text_features.norm(dim=-1, keepdim=True)
     similarity = (model.logit_scale.exp() * image_features @ text_features.T).softmax(dim=-1)
-    values, indices = similarity[0].topk(3)
+    values, indices = similarity[0].topk(k)
     return Topk(values=values, indices=indices)
 
 class SubjectTopk(NamedTuple):
@@ -92,11 +93,11 @@ class SubjectTopk(NamedTuple):
   topk: Topk
 
 models: List[WrappedModel] = [
-  # WrappedModel(
-  #   device=device,
-  #   model_name='ViT-H-14',
-  #   model_ver='laion2b_s32b_b79k'
-  # ), # big
+  WrappedModel(
+    device=device,
+    model_name='ViT-H-14',
+    model_ver='laion2b_s32b_b79k'
+  ), # big
   WrappedModel(
     device=device,
     model_name='ViT-B-32',
@@ -140,9 +141,8 @@ for filename in iglob('square/*.jpg'):
   ]
 
   for subject, topk in subject_topks:
-    print(f"Top predictions for {subject.wrapped_model.model_name} {subject.wrapped_model.model_ver}:")
+    print(f"  Top predictions for {subject.wrapped_model.model_name} {subject.wrapped_model.model_ver}:")
     values, indices = topk
     for value, index in zip(values, indices):
-      print(f"{classes[index]:>16s}: {100 * value.item():.2f}%")
-  
-  print("Done")
+      print(f"    {classes[index]:>30s}: {100 * value.item():.2f}%")
+  print('')
