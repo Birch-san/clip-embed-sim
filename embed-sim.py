@@ -40,7 +40,15 @@ laion_model_ver = 'laion2b_s34b_b79k'
 # laion_model: OpenCLIP = open_clip.create_model(laion_model_name, laion_model_ver, device=device)
 laion_model, _, laion_val_preprocess = open_clip.create_model_and_transforms(laion_model_name, laion_model_ver, device=device)
 laion_model.requires_grad_(False)
-clip_normalize = transforms.Normalize(mean=laion_model.visual.image_mean, std=laion_model.visual.image_std)
+
+# for OpenAI ViT-L-14:
+# mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device)
+# std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device)
+# for LAION checkpoints:
+# mean = laion_model.visual.image_mean
+# std = laion_model.visual.image_std
+# clip_normalize = transforms.Normalize(mean=mean, std=std)
+# actually nevermind we don't need a normalize function; create_model_and_transforms gives us preprocess
 
 img_to_caption = json.load(open('img_to_caption.json', 'r'))
 
