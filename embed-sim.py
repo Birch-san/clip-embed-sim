@@ -2,7 +2,7 @@ import json
 from glob import iglob
 from os import path
 from pathlib import Path
-from typing import Callable, List, NamedTuple, Union
+from typing import Callable, List, NamedTuple, TypeVar, Union
 
 import open_clip
 import torch
@@ -14,12 +14,28 @@ from typing_extensions import TypeAlias
 
 device=torch.device('mps')
 
+T = TypeVar('T')
+Decorator: TypeAlias = Callable[[T], T]
+TensorDecorator: TypeAlias = Decorator[Tensor]
+
+EncodeText: TypeAlias = TensorDecorator
 ImgPreprocess: TypeAlias = Callable[[Image.Image], Tensor]
 DeviceDescriptor: TypeAlias = Union[str, torch.device]
 
 class Topk(NamedTuple):
   values: Tensor
   indices: Tensor
+
+def with_mps_mitigation(encode_text: EncodeText) -> EncodeText:
+  def mitigated_encode_text(captions: Tensor) -> Tensor:
+    if captions.device.type == 'mps' and captions.size(dim=0) > 1:
+      # run serially (instead of batching), then concat afterward.
+      # to avoid MPS bug on pytorch 1.12.1 where layernorm breaks if captions.size(dim=0) > 1
+      return torch.cat([
+        encode_text(caption) for caption in captions.split(1, dim=0)
+      ])
+    return encode_text(captions)
+  return mitigated_encode_text
 
 class WrappedModel:
   model_name: str
@@ -51,14 +67,8 @@ class TestSubject:
   ) -> None:
     self.wrapped_model=wrapped_model
     with no_grad():
-      if self.wrapped_model.device.type == 'mps':
-        # run serially (instead of batching), then concat afterward.
-        # to avoid MPS bug on pytorch 1.12.1 where layernorm breaks if tokens.size(dim=0) > 1
-        self.coarse_class_text_features: Tensor = torch.cat([
-          wrapped_model.model.encode_text(caption_tokens) for caption_tokens in coarse_class_tokens.split(1, dim=0)
-        ])
-      else:
-        self.coarse_class_text_features: Tensor = wrapped_model.model.encode_text(coarse_class_tokens)
+      encode_text: EncodeText = with_mps_mitigation(wrapped_model.model.encode_text)
+      self.coarse_class_text_features: Tensor = encode_text(coarse_class_tokens)
   
   def get_topk(
     self,
@@ -67,6 +77,7 @@ class TestSubject:
     k = 5
   ) -> Topk:
     model: OpenCLIP = self.wrapped_model.model
+    encode_text: EncodeText = with_mps_mitigation(model.encode_text)
     device: DeviceDescriptor = self.wrapped_model.device
     img: Tensor = self.wrapped_model.img_preprocess(pil_img) # [3, 244, 244]
     img_batch: Tensor = img.to(device).unsqueeze(0) # [1, 3, 244, 244]
@@ -75,7 +86,7 @@ class TestSubject:
     # image_features, text_features, logit_scale_exp = laion_model.forward(laion_img_batch, laion_tokens.to(device)) # ([1, 512], [1, 512], [])
 
     with no_grad():
-      caption_text_features: Tensor = model.encode_text(caption_tokens) # [1, 512]
+      caption_text_features: Tensor = encode_text(caption_tokens) # [1, 512]
       image_features: Tensor = model.encode_image(img_batch).to(device) # [n, 512]
 
     text_features = torch.cat([caption_text_features, self.coarse_class_text_features])
