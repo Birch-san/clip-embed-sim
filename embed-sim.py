@@ -2,10 +2,11 @@ import json
 from glob import iglob
 from os import path
 from pathlib import Path
-from typing import Callable, List, NamedTuple, TypeVar, Union
+from typing import Callable, Iterator, List, NamedTuple, TypeVar, Union
 
 import open_clip
 import torch
+import re
 from open_clip import CLIP as OpenCLIP
 from PIL import Image
 from torch import Tensor, no_grad
@@ -86,8 +87,8 @@ class TestSubject:
     # image_features, text_features, logit_scale_exp = laion_model.forward(laion_img_batch, laion_tokens.to(device)) # ([1, 512], [1, 512], [])
 
     with no_grad():
-      caption_text_features: Tensor = encode_text(caption_tokens) # [1, 512]
-      image_features: Tensor = model.encode_image(img_batch).to(device) # [n, 512]
+      caption_text_features: Tensor = encode_text(caption_tokens) # [n, 512]
+      image_features: Tensor = model.encode_image(img_batch).to(device) # [m, 512]
 
     text_features = torch.cat([caption_text_features, self.coarse_class_text_features])
     text_features = F.normalize(text_features, dim=-1)
@@ -121,6 +122,7 @@ models: List[WrappedModel] = [
   ),
 ]
 
+# the 'true' caption (e.g. alt-text which accompanied image)
 img_to_caption = json.load(open('img_to_caption.json', 'r'))
 
 coarse_classes: List[str] = ['a painting', 'trending on artstation']
@@ -131,14 +133,48 @@ subjects: List[TestSubject] = [TestSubject(
   coarse_class_tokens=coarse_class_tokens,
 ) for wrapped_model in models]
 
+matcher = r"^(artist) (.*)$"
+substitute_full_names: List[str] = [
+]
+substitute_given_names: List[str] = [
+]
+substitute_surnames: List[str] = [
+]
+
+def vary_caption(nominal: str) -> Iterator[str]:
+  match = re.match(matcher, nominal)
+  if not match:
+    # unable to produce variations; caption did not match expected format
+    return
+  name = match.group(1)
+  title = match.group(2)
+  # remove name
+  yield title
+  # qualify
+  yield f"a painting of {title}"
+  # replace full name
+  yield from [f"{name} {title}" for name in substitute_full_names]
+
+  _, surname = name.split(' ')
+  # change given name
+  yield from [f"{given_name} {surname} {title}" for given_name in substitute_given_names]
+  # change given name and surname
+  for substitute_surname in substitute_surnames:
+    yield from [f"{given_name} {substitute_surname} {title}" for given_name in substitute_given_names]
+
 for filename in iglob('square/*.jpg'):
   assert path.isfile(filename)
   pil_img: Image.Image = Image.open(filename)
   leafname: str = Path(filename).name
   assert leafname in img_to_caption
   caption: str = img_to_caption[leafname]
-  classes: List[str] = [caption, *coarse_classes]
-  caption_tokens: Tensor = open_clip.tokenize(caption).to(device) # [1, 77]
+  caption_variations: List[str] = list(vary_caption(caption))
+  classes_derived_from_caption: List[str] = [caption, *caption_variations]
+  
+  classes: List[str] = [*classes_derived_from_caption, *coarse_classes]
+
+  # no need to submit tokens for coarse_classes, because Subject already has them
+  caption_tokens: Tensor = open_clip.tokenize(classes_derived_from_caption).to(device) # [n, 77]
 
   print(f"Assessing CLIP image-text similarity for image captioned '{caption}'...")
   subject_topks: List[SubjectTopk] = [
