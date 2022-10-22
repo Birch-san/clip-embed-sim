@@ -107,8 +107,9 @@ class TestSubject:
     similarity = model.logit_scale.exp() * image_features @ text_features.T
     similarity_softmax = similarity.softmax(dim=-1)
 
-    similarity_topk = Topk(*similarity.topk(k))
-    similarity_softmax_topk = Topk(*similarity_softmax.topk(k))
+    # transfer to CPU because MPS doesn't support topk for k>16
+    similarity_topk = Topk(*similarity.cpu().topk(k))
+    similarity_softmax_topk = Topk(*similarity_softmax.cpu().topk(k))
 
     return Similarity(raw=similarity_topk, softmax=similarity_softmax_topk)
 
@@ -188,7 +189,8 @@ for filename in iglob('square/*.jpg'):
   # no need to submit tokens for coarse_classes, because Subject already has them
   caption_tokens: Tensor = open_clip.tokenize(classes_derived_from_caption).to(device) # [n, 77]
 
-  topk=16 # maximum supported on MPS
+  # topk=16 # maximum supported on MPS
+  topk=len(classes) # nevermind we'll just do it on-CPU
   print(f"Assessing CLIP image-text similarity for image captioned,\n'{caption}'...")
   subject_similarities: List[SubjectSimilarity] = [
     SubjectSimilarity(
