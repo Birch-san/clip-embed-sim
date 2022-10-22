@@ -1,4 +1,5 @@
 import json
+import re
 from glob import iglob
 from os import path
 from pathlib import Path
@@ -6,7 +7,6 @@ from typing import Callable, Iterator, List, NamedTuple, TypeVar, Union
 
 import open_clip
 import torch
-import re
 from open_clip import CLIP as OpenCLIP
 from PIL import Image
 from torch import Tensor, no_grad
@@ -26,6 +26,10 @@ DeviceDescriptor: TypeAlias = Union[str, torch.device]
 class Topk(NamedTuple):
   values: Tensor
   indices: Tensor
+
+class Similarity(NamedTuple):
+  raw: Topk
+  softmax: Tensor
 
 def with_mps_mitigation(encode_text: EncodeText) -> EncodeText:
   def mitigated_encode_text(captions: Tensor) -> Tensor:
@@ -71,12 +75,12 @@ class TestSubject:
       encode_text: EncodeText = with_mps_mitigation(wrapped_model.model.encode_text)
       self.coarse_class_text_features: Tensor = encode_text(coarse_class_tokens)
   
-  def get_topk(
+  def get_similarity(
     self,
     pil_img: Image.Image,
     caption_tokens: Tensor,
     k = 5
-  ) -> Topk:
+  ) -> Similarity:
     model: OpenCLIP = self.wrapped_model.model
     encode_text: EncodeText = with_mps_mitigation(model.encode_text)
     device: DeviceDescriptor = self.wrapped_model.device
@@ -89,6 +93,9 @@ class TestSubject:
     with no_grad():
       caption_text_features: Tensor = encode_text(caption_tokens) # [n, 512]
       image_features: Tensor = model.encode_image(img_batch).to(device) # [m, 512]
+    
+    # we are never submitting more than one image at a time; eliminate batch dim to simplify slightly
+    image_features = image_features.squeeze()
 
     text_features = torch.cat([caption_text_features, self.coarse_class_text_features])
     text_features = F.normalize(text_features, dim=-1)
@@ -96,13 +103,18 @@ class TestSubject:
 
     image_features /= image_features.norm(dim=-1, keepdim=True)
     text_features /= text_features.norm(dim=-1, keepdim=True)
-    similarity = (model.logit_scale.exp() * image_features @ text_features.T).softmax(dim=-1)
-    values, indices = similarity[0].topk(k)
-    return Topk(values=values, indices=indices)
 
-class SubjectTopk(NamedTuple):
+    similarity = model.logit_scale.exp() * image_features @ text_features.T
+    similarity_softmax = similarity.softmax(dim=-1)
+
+    similarity_topk = Topk(*similarity.topk(k))
+    similarity_softmax_topk = Topk(*similarity_softmax.topk(k))
+
+    return Similarity(raw=similarity_topk, softmax=similarity_softmax_topk)
+
+class SubjectSimilarity(NamedTuple):
   subject: TestSubject
-  topk: Topk
+  similarity: Similarity
 
 models: List[WrappedModel] = [
   WrappedModel(
@@ -176,20 +188,23 @@ for filename in iglob('square/*.jpg'):
   # no need to submit tokens for coarse_classes, because Subject already has them
   caption_tokens: Tensor = open_clip.tokenize(classes_derived_from_caption).to(device) # [n, 77]
 
-  print(f"Assessing CLIP image-text similarity for image captioned '{caption}'...")
-  subject_topks: List[SubjectTopk] = [
-    SubjectTopk(
+  topk=16 # maximum supported on MPS
+  print(f"Assessing CLIP image-text similarity for image captioned,\n'{caption}'...")
+  subject_similarities: List[SubjectSimilarity] = [
+    SubjectSimilarity(
       subject=subject,
-      topk=subject.get_topk(
+      similarity=subject.get_similarity(
         pil_img=pil_img,
-        caption_tokens=caption_tokens
+        caption_tokens=caption_tokens,
+        k=topk
       )
     ) for subject in subjects
   ]
 
-  for subject, topk in subject_topks:
-    print(f"  Top predictions for {subject.wrapped_model.model_name} {subject.wrapped_model.model_ver}:")
-    values, indices = topk
-    for value, index in zip(values, indices):
-      print(f"    {classes[index]:>30s}: {100 * value.item():.2f}%")
+  print(f"  Top {topk} predictions for")
+  for subject, similarity in subject_similarities:
+    print(f"    {subject.wrapped_model.model_name} {subject.wrapped_model.model_ver}:")
+    raw, softmax = similarity
+    for raw_value, raw_index, sm_value, sm_index in zip(raw.values, raw.indices, softmax.values, softmax.indices):
+      print(f"      {classes[sm_index]:>60s}: {100 * sm_value.item():.2f}% {raw_value.item():.2f}")
   print('')
